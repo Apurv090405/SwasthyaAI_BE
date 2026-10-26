@@ -10,7 +10,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     OutputAudioRawFrame,
 )
-from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.serializers.base_serializer import FrameSerializer
 
 
 class BrowserPCMSerializer(FrameSerializer):
@@ -18,15 +18,13 @@ class BrowserPCMSerializer(FrameSerializer):
 
     - Deserializes: binary WebSocket messages → InputAudioRawFrame
     - Serializes: OutputAudioRawFrame → raw binary PCM bytes
+      (Pipecat 1.x sends bytes as binary frames; the old `type` property is gone)
     """
 
     def __init__(self, sample_rate: int = 16000, num_channels: int = 1):
+        super().__init__()  # base sets _params, which should_ignore_frame() reads
         self._sample_rate = sample_rate
         self._num_channels = num_channels
-
-    @property
-    def type(self) -> FrameSerializerType:
-        return FrameSerializerType.BINARY
 
     async def serialize(self, frame: Frame) -> bytes | None:
         if isinstance(frame, OutputAudioRawFrame):

@@ -15,15 +15,17 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.frames.frames import TTSSpeakFrame, StartInterruptionFrame, EndFrame
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.serializers.plivo import PlivoFrameSerializer
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam.tts import SarvamTTSService
+from services.sarvam_voice import make_stt, make_tts
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.transcriptions.language import Language
@@ -170,8 +172,6 @@ async def run_vobiz_pipeline(
     llm_provider = call_data.get("llm_provider", "openai")
     logger.info(f"Starting Vobiz pipeline for stream {stream_id}, llm_provider={llm_provider}")
 
-    session = await get_global_session()
-
     # Load prompt — use per-number override if configured
     to_number = call_data.get("data", {}).get("To") or call_data.get("data", {}).get("to")
 
@@ -190,24 +190,8 @@ async def run_vobiz_pipeline(
     llm_params = get_openai_compat_params(llm_provider)
     llm_service = OpenAILLMService(**llm_params)
     
-    stt_service = SarvamSTTService(
-        api_key=settings.SARVAM_API_KEY,
-        model="saarika:v2.5",
-        # No language param = auto-detect across 12 Indian languages
-    )
-
-    tts_service = SarvamTTSService(
-        api_key=settings.SARVAM_API_KEY,
-        voice_id=settings.SARVAM_VOICE_ID,
-        model="bulbul:v2",
-        aiohttp_session=session,
-        sample_rate=8000,
-        params=SarvamTTSService.InputParams(
-            language=Language.HI,
-            output_audio_codec="linear16",
-            enable_preprocessing=True
-        )
-    )
+    stt_service = make_stt()  # auto-detects the caller's language
+    tts_service = make_tts(sample_rate=8000)
 
     # Dynamic language switcher — updates TTS language when STT detects a new language
     from services.language_detect import LanguageDetectTTSSwitcher
@@ -215,8 +199,7 @@ async def run_vobiz_pipeline(
 
     # Context
     messages = [{"role": "system", "content": system_prompt}]
-    context = OpenAILLMContext(messages=messages)
-    context_aggregator = llm_service.create_context_aggregator(context)
+    context = LLMContext(messages=messages)
 
     # Transport & Serializer
     # Vobiz uses Plivo-compatible XML and WebSocket framing
@@ -232,7 +215,10 @@ async def run_vobiz_pipeline(
     )
 
     vad_analyzer = SileroVADAnalyzer(params=VADParams(start_secs=0.1, stop_secs=0.2))
-    turn_analyzer = LocalSmartTurnAnalyzerV3()
+    # Pipecat 1.x: VAD lives on the user aggregator; Smart Turn v3 is the default stop strategy.
+    context_aggregator = LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
+    )
 
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
@@ -240,8 +226,6 @@ async def run_vobiz_pipeline(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False, # Crucial for telephony
-            vad_analyzer=vad_analyzer,
-            turn_analyzer=turn_analyzer,
             serializer=serializer,
         ),
     )
@@ -267,7 +251,6 @@ async def run_vobiz_pipeline(
             audio_out_sample_rate=8000,
             enable_metrics=True,
             enable_usage_metrics=True,
-            allow_interruptions=True,
         ),
     )
 

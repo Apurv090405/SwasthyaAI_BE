@@ -6,6 +6,7 @@ from typing import Dict, List, Any
 import pdfplumber
 
 from config import settings
+from llm_factory import get_embeddings
 
 
 class PDFService:
@@ -87,18 +88,13 @@ class PDFService:
         # Extract texts for batch embedding
         texts = [chunk["text"] for chunk in chunks]
         
-        # Create embeddings using sentence transformers (batch processing)
-        embeddings = settings.embedding_model.encode(
-            texts,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-            batch_size=settings.EMBEDDING_BATCH_SIZE
-        )
-        
+        # Create embeddings via the embeddings API (client batches internally)
+        embeddings = get_embeddings().embed_documents(texts)
+
         # Prepare data for LanceDB
         data = []
         for i, chunk in enumerate(chunks):
-            embedding = embeddings[i].tolist()  # Convert numpy array to list
+            embedding = embeddings[i]
             doc_id = str(uuid.uuid4())
             
             data.append({

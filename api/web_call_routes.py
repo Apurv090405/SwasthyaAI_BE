@@ -15,15 +15,17 @@ import uuid
 from fastapi import APIRouter, WebSocket
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.frames.frames import TTSSpeakFrame, InterruptionFrame
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.openai.llm import OpenAILLMContext
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam.tts import SarvamTTSService
+from services.sarvam_voice import make_stt, make_tts
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -31,15 +33,14 @@ from pipecat.transports.websocket.fastapi import (
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.transcriptions.language import Language
 
-from config import settings
 from llm_factory import get_openai_compat_params
 from services.language_detect import LanguageDetectTTSSwitcher
 from api.browser_serializer import BrowserPCMSerializer
 
 try:
-    from api.voice_routes import get_global_session, load_prompt_from_file, send_call_webhook
+    from api.voice_routes import load_prompt_from_file, send_call_webhook
 except ImportError:
-    from voice_routes import get_global_session, load_prompt_from_file, send_call_webhook
+    from voice_routes import load_prompt_from_file, send_call_webhook
 
 
 web_call_router = APIRouter(prefix="/web", tags=["web-call"])
@@ -90,46 +91,30 @@ async def run_web_pipeline(websocket: WebSocket, stream_id: str, call_data: dict
         f"Starting WEB pipeline: stream={stream_id}, llm={llm_provider}"
     )
 
-    session = await get_global_session()
     system_prompt = load_prompt_from_file("inbound_prompt.md")
 
     # LLM
     llm_params = get_openai_compat_params(llm_provider)
     llm_service = OpenAILLMService(**llm_params)
 
-    # STT — auto-detect language
-    stt_service = SarvamSTTService(
-        api_key=settings.SARVAM_API_KEY,
-        model="saarika:v2.5",
-    )
-
-    # TTS — starts with Hindi, switches dynamically based on detected language
-    tts_service = SarvamTTSService(
-        api_key=settings.SARVAM_API_KEY,
-        voice_id=settings.SARVAM_VOICE_ID,
-        model="bulbul:v2",
-        aiohttp_session=session,
-        sample_rate=16000,
-        params=SarvamTTSService.InputParams(
-            language=Language.HI,
-            output_audio_codec="linear16",
-            enable_preprocessing=True,
-        ),
-    )
+    # STT auto-detects language; TTS starts in Hindi and follows the caller via the switcher
+    stt_service = make_stt()
+    tts_service = make_tts(sample_rate=16000)
 
     # Dynamic language switcher
     language_switcher = LanguageDetectTTSSwitcher(default_language=Language.HI)
 
     # Context
     messages = [{"role": "system", "content": system_prompt}]
-    context = OpenAILLMContext(messages=messages)
-    context_aggregator = llm_service.create_context_aggregator(context)
+    context = LLMContext(messages=messages)
 
-    # VAD + Smart Turn Detection
+    # Pipecat 1.x: VAD lives on the user aggregator; Smart Turn v3 is the default stop strategy.
     vad_analyzer = SileroVADAnalyzer(
         params=VADParams(start_secs=0.2, stop_secs=0.3)
     )
-    turn_analyzer = LocalSmartTurnAnalyzerV3()
+    context_aggregator = LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
+    )
 
     # Serializer for raw browser PCM audio
     serializer = BrowserPCMSerializer(sample_rate=16000, num_channels=1)
@@ -141,8 +126,6 @@ async def run_web_pipeline(websocket: WebSocket, stream_id: str, call_data: dict
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=vad_analyzer,
-            turn_analyzer=turn_analyzer,
             serializer=serializer,
         ),
     )
@@ -165,7 +148,6 @@ async def run_web_pipeline(websocket: WebSocket, stream_id: str, call_data: dict
             audio_out_sample_rate=16000,
             enable_metrics=True,
             enable_usage_metrics=True,
-            allow_interruptions=True,
         ),
     )
 

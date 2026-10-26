@@ -6,6 +6,7 @@ import lancedb
 import pandas as pd
 
 from config import settings
+from llm_factory import get_embeddings
 
 
 class LanceDBService:
@@ -128,11 +129,7 @@ class LanceDBService:
         if not query_text or not str(query_text).strip():
             return []
         q = str(query_text).strip()
-        vec = settings.embedding_model.encode(
-            q,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        ).tolist()
+        vec = get_embeddings().embed_query(q)
         fetch_k = top_k * 20 if source else top_k
         hits = self.search(vec, top_k=max(fetch_k, top_k), table_name=table_name)
         if source:

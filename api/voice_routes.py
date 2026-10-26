@@ -18,21 +18,21 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.frames.frames import LLMRunFrame, StartInterruptionFrame, TTSSpeakFrame
+from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.serializers.exotel import ExotelFrameSerializer
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam.tts import SarvamTTSService
+from services.sarvam_voice import make_stt, make_tts
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.transcriptions.language import Language
-
-# from pipecat.processors.observers.user_bot_latency import UserBotLatencyLogObserver
-from pipecat.observers.loggers.user_bot_latency_log_observer import UserBotLatencyLogObserver
 
 LATENCY_OBSERVER_AVAILABLE = True
 
@@ -142,10 +142,10 @@ def make_ws_url(stream_id: str, call_id: Optional[str] = None) -> str:
 async def send_call_webhook(
     stream_id: str,
     call_id: str,
-    context: Optional[OpenAILLMContext] = None,
+    context: Optional[LLMContext] = None,
     task: Optional[PipelineTask] = None,
     call_info: Optional[Dict[str, Any]] = None,
-    latency_observer: Optional[UserBotLatencyLogObserver] = None
+    latency_observer: Optional[UserBotLatencyObserver] = None
 ):
     """Send call transcript, metrics, and related information to webhook."""
     if not settings.WEBHOOK_URL:
@@ -264,28 +264,14 @@ async def run_inbound_pipeline(
         f"call_id={call_id}, llm_provider={llm_provider}"
     )
 
-    # Use global session for connection pooling
-    session = await get_global_session()
-
     # Load inbound prompt
     inbound_prompt = load_prompt_from_file("inbound_prompt.md")
 
     # Initialize LLM service — Gemini uses its OpenAI-compatible endpoint
     llm_params = get_openai_compat_params(llm_provider)
     llm_service = OpenAILLMService(**llm_params)
-    stt_service = SarvamSTTService(
-        api_key=settings.SARVAM_API_KEY,
-        model="saarika:v2.5",
-        # No language param = auto-detect across 12 Indian languages
-    )
-    tts_service = SarvamTTSService(
-        api_key=settings.SARVAM_API_KEY,
-        voice_id=settings.SARVAM_VOICE_ID,
-        model="bulbul:v2",
-        aiohttp_session=session,
-        sample_rate=8000,
-        params=SarvamTTSService.InputParams(language=Language.HI, output_audio_codec="linear16", enable_preprocessing=True)
-    )
+    stt_service = make_stt()  # auto-detects the caller's language
+    tts_service = make_tts(sample_rate=8000)
 
     # Dynamic language switcher — updates TTS language when STT detects a new language
     from services.language_detect import LanguageDetectTTSSwitcher
@@ -296,8 +282,7 @@ async def run_inbound_pipeline(
         "role": "system",
         "content": inbound_prompt
     }
-    context = OpenAILLMContext(messages=[initial_system_message])
-    context_aggregator = llm_service.create_context_aggregator(context)
+    context = LLMContext(messages=[initial_system_message])
 
     # Serializer for Exotel
     serializer = ExotelFrameSerializer(stream_sid=stream_id, call_sid=call_id)
@@ -311,20 +296,19 @@ async def run_inbound_pipeline(
         stop_secs=0.2,   # Optimized for Smart Turn Detection
     )
     vad_analyzer = SileroVADAnalyzer(params=vad_params)
-    
-    # Smart Turn Detection: Uses ML model to detect when user finishes speaking
-    # Better than basic VAD as it recognizes conversational cues (intonation, linguistic signals)
-    # LocalSmartTurnAnalyzerV3 runs on-device, supports 23 languages, efficient on CPU
-    turn_analyzer = LocalSmartTurnAnalyzerV3()
-    
+
+    # Pipecat 1.x: VAD lives on the user aggregator (transport params would silently ignore it).
+    # Smart Turn v3 (LocalSmartTurnAnalyzerV3) is already the default user-turn stop strategy.
+    context_aggregator = LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=vad_analyzer,
-            turn_analyzer=turn_analyzer,  # Smart Turn Detection for better turn-taking
             serializer=serializer,
         ),
     )
@@ -351,7 +335,7 @@ async def run_inbound_pipeline(
     observers = []
     latency_observer = None
     if LATENCY_OBSERVER_AVAILABLE:
-        latency_observer = UserBotLatencyLogObserver()
+        latency_observer = UserBotLatencyObserver()
         observers.append(latency_observer)
         logger.info(f"Latency monitoring enabled for stream {stream_id}")
 
@@ -362,7 +346,6 @@ async def run_inbound_pipeline(
             audio_out_sample_rate=8000,
             enable_metrics=True,
             enable_usage_metrics=True,
-            allow_interruptions=True,
         ),
         observers=observers if observers else None,
     )
@@ -392,7 +375,7 @@ async def run_inbound_pipeline(
         logger.info(f"Cleaning up inbound pipeline for stream {stream_id}")
         try:
             # Send interruption frame to stop any ongoing TTS
-            await task.queue_frames([StartInterruptionFrame()])
+            await task.queue_frames([InterruptionFrame()])
         except Exception as e:
             logger.warning(f"Error sending interruption frame: {e}")
         
@@ -436,28 +419,14 @@ async def run_outbound_pipeline(
         f"call_id={call_id}, llm_provider={llm_provider}"
     )
 
-    # Use global session for connection pooling
-    session = await get_global_session()
-
     # Load outbound prompt
     outbound_prompt = load_prompt_from_file("outbound_prompt.md")
 
     # Initialize LLM service — Gemini uses its OpenAI-compatible endpoint
     llm_params = get_openai_compat_params(llm_provider)
     llm_service = OpenAILLMService(**llm_params)
-    stt_service = SarvamSTTService(
-        api_key=settings.SARVAM_API_KEY,
-        model="saarika:v2.5",
-        # No language param = auto-detect across 12 Indian languages
-    )
-    tts_service = SarvamTTSService(
-        api_key=settings.SARVAM_API_KEY,
-        voice_id=settings.SARVAM_VOICE_ID,
-        model="bulbul:v2",
-        aiohttp_session=session,
-        sample_rate=8000,
-        params=SarvamTTSService.InputParams(language=Language.HI, output_audio_codec="linear16", enable_preprocessing=True)
-    )
+    stt_service = make_stt()  # auto-detects the caller's language
+    tts_service = make_tts(sample_rate=8000)
 
     # Dynamic language switcher — updates TTS language when STT detects a new language
     from services.language_detect import LanguageDetectTTSSwitcher
@@ -468,8 +437,7 @@ async def run_outbound_pipeline(
         "role": "system",
         "content": outbound_prompt
     }
-    context = OpenAILLMContext(messages=[initial_system_message])
-    context_aggregator = llm_service.create_context_aggregator(context)
+    context = LLMContext(messages=[initial_system_message])
 
     # Serializer for Exotel
     serializer = ExotelFrameSerializer(stream_sid=stream_id, call_sid=call_id)
@@ -483,20 +451,19 @@ async def run_outbound_pipeline(
         stop_secs=0.2,   # Optimized for Smart Turn Detection
     )
     vad_analyzer = SileroVADAnalyzer(params=vad_params)
-    
-    # Smart Turn Detection: Uses ML model to detect when user finishes speaking
-    # Better than basic VAD as it recognizes conversational cues (intonation, linguistic signals)
-    # LocalSmartTurnAnalyzerV3 runs on-device, supports 23 languages, efficient on CPU
-    turn_analyzer = LocalSmartTurnAnalyzerV3()
-    
+
+    # Pipecat 1.x: VAD lives on the user aggregator (transport params would silently ignore it).
+    # Smart Turn v3 (LocalSmartTurnAnalyzerV3) is already the default user-turn stop strategy.
+    context_aggregator = LLMContextAggregatorPair(
+        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=vad_analyzer,
-            turn_analyzer=turn_analyzer,  # Smart Turn Detection for better turn-taking
             serializer=serializer,
         ),
     )
@@ -523,7 +490,7 @@ async def run_outbound_pipeline(
     observers = []
     latency_observer = None
     if LATENCY_OBSERVER_AVAILABLE:
-        latency_observer = UserBotLatencyLogObserver()
+        latency_observer = UserBotLatencyObserver()
         observers.append(latency_observer)
         logger.info(f"Latency monitoring enabled for stream {stream_id}")
 
@@ -534,7 +501,6 @@ async def run_outbound_pipeline(
             audio_out_sample_rate=8000,
             enable_metrics=True,
             enable_usage_metrics=True,
-            allow_interruptions=True,
         ),
         observers=observers if observers else None,
     )
@@ -564,7 +530,7 @@ async def run_outbound_pipeline(
         logger.info(f"Cleaning up outbound pipeline for stream {stream_id}")
         try:
             # Send interruption frame to stop any ongoing TTS
-            await task.queue_frames([StartInterruptionFrame()])
+            await task.queue_frames([InterruptionFrame()])
         except Exception as e:
             logger.warning(f"Error sending interruption frame: {e}")
         

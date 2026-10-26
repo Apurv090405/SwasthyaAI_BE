@@ -62,30 +62,28 @@ class TextIngestRequest(BaseModel):
 
 
 # ── Dashboard Models ──────────────────────────────────────────────────
+# No user_id fields: routes take the caller from the access token (auth.current_user).
+# A user_id still sent by older clients is ignored (pydantic drops extra fields).
 
 class ApproveReportRequest(BaseModel):
     """Approve or revoke a clinical report."""
     call_id: str
-    user_id: str
     notes: Optional[str] = None
 
 
 class AgentConfigRequest(BaseModel):
     """Save calling agent configuration."""
-    user_id: str
     name: str = Field(default="Default")
     config: dict = Field(..., description="Full agent config object (telco, llm, voice, etc.)")
 
 
 class UserPreferencesRequest(BaseModel):
     """Save user preferences (language, voice, theme)."""
-    user_id: str
     preferences: dict = Field(..., description="Preferences object (language, voice_uri, theme, etc.)")
 
 
 class PhoneRegistryRequest(BaseModel):
     """Add a phone number to the manual registry."""
-    user_id: str
     phone_number: str
     provider: str = Field(default="manual")
     label: Optional[str] = None
@@ -95,5 +93,4 @@ class PhoneRegistryRequest(BaseModel):
 class PhoneRegistryDeleteRequest(BaseModel):
     """Delete a phone registry entry."""
     entry_id: str
-    user_id: str
 
