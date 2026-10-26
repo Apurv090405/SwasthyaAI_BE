@@ -6,7 +6,7 @@ and:
 1. Pushes TTSUpdateSettingsFrame to switch TTS language on the fly
 2. Pushes LLMMessagesAppendFrame to tell the LLM to respond in the detected language
 
-Compatible with Pipecat 0.0.94.
+Uses Pipecat 1.x typed settings deltas (the `settings={...}` dict form is deprecated).
 """
 
 from loguru import logger
@@ -18,10 +18,11 @@ from pipecat.frames.frames import (
     TTSUpdateSettingsFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.settings import TTSSettings
 from pipecat.transcriptions.language import Language
 
 
-# Sarvam-supported languages for TTS (bulbul:v2 and v3)
+# Languages bulbul:v3 can speak (see services/sarvam_voice.py)
 SARVAM_TTS_LANGUAGES = {
     Language.HI, Language.HI_IN,
     Language.BN, Language.BN_IN,
@@ -103,9 +104,7 @@ class LanguageDetectTTSSwitcher(FrameProcessor):
                 )
 
                 # 1. Switch TTS language
-                tts_frame = TTSUpdateSettingsFrame(
-                    settings={"language": normalized}
-                )
+                tts_frame = TTSUpdateSettingsFrame(delta=TTSSettings(language=normalized))
                 await self.push_frame(tts_frame, FrameDirection.DOWNSTREAM)
 
                 # 2. Tell the LLM to respond in the detected language

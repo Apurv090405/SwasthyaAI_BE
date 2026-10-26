@@ -42,6 +42,7 @@ from api.vobiz_routes import vobiz_router, run_vobiz_pipeline, VOBIZ_CALLS
 from api.telnyx_routes import telnyx_router, run_telnyx_pipeline, TELNYX_CALLS
 from api.web_call_routes import web_call_router, run_web_pipeline, WEB_CALLS
 from api.dashboard_routes import dashboard_router
+from api.voicelink_routes import voicelink_router
 from services.supabase_voice import supabase_health_dict
 from webhook import app as webhook_receiver_app, receive_webhook
 
@@ -115,6 +116,7 @@ app.include_router(vobiz_router)
 app.include_router(telnyx_router)
 app.include_router(web_call_router)
 app.include_router(dashboard_router)
+app.include_router(voicelink_router)
 
 # WebSocket endpoint at root level (Exotel calls this directly)
 @app.websocket("/ws/exotel/{stream_id}")

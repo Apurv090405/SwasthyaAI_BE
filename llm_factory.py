@@ -15,6 +15,7 @@ Usage:
 """
 
 import contextvars
+from functools import lru_cache
 from typing import Optional
 
 # Per-async-task context variable — thread-safe and coroutine-safe
@@ -79,6 +80,26 @@ def get_llm(provider: Optional[str] = None):
 
     raise ValueError(
         f"Unknown LLM provider '{resolved}'. Supported values: 'openai', 'gemini'."
+    )
+
+
+@lru_cache(maxsize=1)
+def get_embeddings():
+    """
+    Return the LangChain embeddings client used for RAG (``embed_query`` / ``embed_documents``).
+
+    Always OpenAI, independent of the per-request chat provider: stored vectors and query
+    vectors must come from the same model. Changing EMBEDDING_MODEL means re-ingesting
+    LanceDB documents.
+    """
+    from config import settings
+    from langchain_openai import OpenAIEmbeddings
+
+    if not settings.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set; it is required for RAG embeddings.")
+    return OpenAIEmbeddings(
+        model=settings.EMBEDDING_MODEL_NAME or "text-embedding-3-small",
+        api_key=settings.OPENAI_API_KEY,
     )
 
 

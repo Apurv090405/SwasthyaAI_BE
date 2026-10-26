@@ -43,7 +43,7 @@ AI-powered clinical health assistant backend built with **FastAPI**, **LangGraph
 | Framework | FastAPI |
 | AI Orchestration | LangGraph Supervisor |
 | LLM | OpenAI GPT-4.1 / Google Gemini 2.5 Flash |
-| Embeddings | sentence-transformers/all-MiniLM-L6-v2 |
+| Embeddings | OpenAI text-embedding-3-small |
 | Vector DB | LanceDB |
 | Search | SerpAPI |
 | Voice | Pipecat + Sarvam AI |
@@ -99,7 +99,6 @@ swasthya-ai-python/
 ├── agents.py               # LangGraph agent definitions
 ├── config.py               # Settings & environment variables
 ├── llm_factory.py          # LLM provider factory (OpenAI/Gemini)
-├── model.py                # Pydantic request/response models
 ├── models.py               # Data models
 ├── tools.py                # Agent tools (search, RAG, etc.)
 ├── webhook.py              # Webhook handlers

@@ -7,9 +7,10 @@ phone registry, and paginated call history — all backed by Supabase.
 
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from loguru import logger
 
+from auth import current_user
 from models import (
     AgentConfigRequest,
     ApproveReportRequest,
@@ -87,26 +88,29 @@ async def calls_history(
 
 # ── Report Approvals ─────────────────────────────────────────────────
 
+# Everything below acts on the caller's own rows: user_id comes from the access token
+# (auth.current_user), never from the request, because Supabase is called with the service role.
+
 @dashboard_router.get("/reports/approvals")
-async def list_approvals(user_id: str = Query(...)):
+async def list_approvals(user_id: str = Depends(current_user)):
     """List all approved reports for a user."""
     approvals = await get_approvals(user_id)
     return {"approvals": approvals, "count": len(approvals)}
 
 
 @dashboard_router.post("/reports/approve")
-async def approve_report_endpoint(req: ApproveReportRequest):
+async def approve_report_endpoint(req: ApproveReportRequest, user_id: str = Depends(current_user)):
     """Approve a clinical report."""
-    ok = await approve_report(req.call_id, req.user_id, req.notes)
+    ok = await approve_report(req.call_id, user_id, req.notes)
     if ok:
         return {"status": "approved", "call_id": req.call_id}
     return {"status": "error", "message": "Failed to approve report"}
 
 
 @dashboard_router.post("/reports/revoke")
-async def revoke_report_endpoint(req: ApproveReportRequest):
+async def revoke_report_endpoint(req: ApproveReportRequest, user_id: str = Depends(current_user)):
     """Revoke approval for a clinical report."""
-    ok = await revoke_approval(req.call_id, req.user_id)
+    ok = await revoke_approval(req.call_id, user_id)
     if ok:
         return {"status": "revoked", "call_id": req.call_id}
     return {"status": "error", "message": "Failed to revoke approval"}
@@ -115,7 +119,7 @@ async def revoke_report_endpoint(req: ApproveReportRequest):
 # ── Agent Configuration ──────────────────────────────────────────────
 
 @dashboard_router.get("/agent-config")
-async def get_agent_config_endpoint(user_id: str = Query(...)):
+async def get_agent_config_endpoint(user_id: str = Depends(current_user)):
     """Load saved agent config for a user."""
     config = await get_agent_config(user_id)
     if config:
@@ -124,9 +128,9 @@ async def get_agent_config_endpoint(user_id: str = Query(...)):
 
 
 @dashboard_router.post("/agent-config")
-async def save_agent_config_endpoint(req: AgentConfigRequest):
+async def save_agent_config_endpoint(req: AgentConfigRequest, user_id: str = Depends(current_user)):
     """Save or update agent configuration."""
-    config_id = await save_agent_config(req.user_id, req.config, req.name)
+    config_id = await save_agent_config(user_id, req.config, req.name)
     if config_id:
         return {"status": "saved", "id": config_id}
     return {"status": "error", "message": "Failed to save config"}
@@ -135,35 +139,35 @@ async def save_agent_config_endpoint(req: AgentConfigRequest):
 # ── User Preferences ────────────────────────────────────────────────
 
 @dashboard_router.get("/user-preferences")
-async def get_user_prefs(user_id: str = Query(...)):
+async def get_user_prefs(user_id: str = Depends(current_user)):
     """Load user preferences (language, voice, theme)."""
     prefs = await get_user_preferences(user_id)
     return {"user_id": user_id, "preferences": prefs}
 
 
 @dashboard_router.post("/user-preferences")
-async def save_user_prefs(req: UserPreferencesRequest):
+async def save_user_prefs(req: UserPreferencesRequest, user_id: str = Depends(current_user)):
     """Save user preferences."""
-    ok = await save_user_preferences(req.user_id, req.preferences)
+    ok = await save_user_preferences(user_id, req.preferences)
     if ok:
-        return {"status": "saved", "user_id": req.user_id}
+        return {"status": "saved", "user_id": user_id}
     return {"status": "error", "message": "Failed to save preferences"}
 
 
 # ── Phone Registry ──────────────────────────────────────────────────
 
 @dashboard_router.get("/phone-registry")
-async def list_phone_registry(user_id: str = Query(...)):
+async def list_phone_registry(user_id: str = Depends(current_user)):
     """List manually registered phone numbers for a user."""
     entries = await get_phone_registry(user_id)
     return {"entries": entries, "count": len(entries)}
 
 
 @dashboard_router.post("/phone-registry")
-async def add_phone_registry(req: PhoneRegistryRequest):
+async def add_phone_registry(req: PhoneRegistryRequest, user_id: str = Depends(current_user)):
     """Add a phone number to the manual registry."""
     entry_id = await add_phone_entry(
-        req.user_id, req.phone_number, req.provider, req.label, req.is_default
+        user_id, req.phone_number, req.provider, req.label, req.is_default
     )
     if entry_id:
         return {"status": "added", "id": entry_id}
@@ -171,9 +175,9 @@ async def add_phone_registry(req: PhoneRegistryRequest):
 
 
 @dashboard_router.post("/phone-registry/delete")
-async def delete_phone_registry(req: PhoneRegistryDeleteRequest):
+async def delete_phone_registry(req: PhoneRegistryDeleteRequest, user_id: str = Depends(current_user)):
     """Delete a phone registry entry."""
-    ok = await delete_phone_entry(req.entry_id, req.user_id)
+    ok = await delete_phone_entry(req.entry_id, user_id)
     if ok:
         return {"status": "deleted", "id": req.entry_id}
     return {"status": "error", "message": "Failed to delete phone entry"}

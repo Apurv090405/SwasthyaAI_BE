@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 
 # Load `.env` from the project root (this file's directory), not from the shell's
 # current working directory. That way `uvicorn` works even when started from ~ or another folder.
@@ -33,10 +32,8 @@ class Settings:
     OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-4.1")
     GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
     DEFAULT_LLM_PROVIDER: str = os.environ.get("DEFAULT_LLM_PROVIDER", "openai")
-    EMBEDDING_MODEL_NAME: str = os.environ.get(
-        "EMBEDDING_MODEL", 
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
+    # API embedding model; empty = provider default (see llm_factory.get_embeddings)
+    EMBEDDING_MODEL_NAME: str = os.environ.get("EMBEDDING_MODEL", "")
     
     # PDF Processing Defaults
     DEFAULT_CHUNK_SIZE: int = 1000
@@ -67,7 +64,8 @@ class Settings:
     EXOTEL_API_BASE: str = os.environ.get("EXOTEL_API_BASE", "https://api.exotel.com/v1")
     DEEPGRAM_API_KEY: Optional[str] = os.environ.get("DEEPGRAM_API_KEY")
     SARVAM_API_KEY: Optional[str] = os.environ.get("SARVAM_API_KEY")
-    SARVAM_VOICE_ID: str = os.environ.get("SARVAM_VOICE_ID", "default_voice")
+    # bulbul:v3 speaker (e.g. priya, ritu, neha, kavya, shubh, aditya); v2 names like anushka no longer work
+    SARVAM_VOICE_ID: str = os.environ.get("SARVAM_VOICE_ID", "priya")
     WEBHOOK_URL: Optional[str] = os.environ.get("WEBHOOK_URL")
 
     # Supabase (optional — service role for server-side voice_calls / analytics rows)
@@ -98,7 +96,11 @@ class Settings:
     # DNS hostname only (e.g. abc123.ngrok-free.app). Telnyx must reach /telnyx/answer and wss://.../ws/telnyx/
     # — set this when HOST is localhost. Optional path may be stripped if pasted by mistake.
     TELNYX_PUBLIC_HOST: Optional[str] = os.environ.get("TELNYX_PUBLIC_HOST")
-    
+
+    # VoiceLink (India DIDs) — platform reseller account used for number purchase
+    VOICELINK_USERNAME: Optional[str] = os.environ.get("VOICELINK_USERNAME")
+    VOICELINK_PASSWORD: Optional[str] = os.environ.get("VOICELINK_PASSWORD")
+
     def __init__(self):
         """Validate required settings on initialization."""
         if not self.OPENAI_API_KEY and not self.GEMINI_API_KEY:
@@ -108,14 +110,6 @@ class Settings:
         if self.DEFAULT_LLM_PROVIDER == "gemini" and not self.GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY must be set when DEFAULT_LLM_PROVIDER is 'gemini'")
     
-    @property
-    def embedding_model(self) -> SentenceTransformer:
-        """Lazy load embedding model."""
-        if not hasattr(self, "_embedding_model"):
-            print(f"Loading embedding model: {self.EMBEDDING_MODEL_NAME}")
-            self._embedding_model = SentenceTransformer(self.EMBEDDING_MODEL_NAME)
-            print("Embedding model loaded successfully")
-        return self._embedding_model
 
 
 # Global settings instance

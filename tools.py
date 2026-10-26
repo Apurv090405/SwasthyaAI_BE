@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional
 from langchain_core.tools import tool
 
 from config import settings
-from llm_factory import get_llm
+from llm_factory import get_embeddings, get_llm
 from services.lancedb_service import LanceDBService
 from services.search_service import SearchService
 from prompts import (
@@ -124,11 +124,7 @@ def query_clinical_guidelines(keywords: str, top_k: int = 5) -> str:
     """
     try:
         # Create query embedding
-        query_embedding = settings.embedding_model.encode(
-            keywords,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        ).tolist()
+        query_embedding = get_embeddings().embed_query(keywords)
         
         # Search LanceDB
         hits = _lancedb_service.search(query_embedding, top_k=top_k)
