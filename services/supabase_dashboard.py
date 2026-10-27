@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import math
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import aiohttp
+from fastapi import HTTPException
 from loguru import logger
 
 from config import settings
@@ -15,6 +19,49 @@ from services.supabase_voice import _credentials_present, _headers, verify_supab
 
 def _base_url() -> str:
     return settings.SUPABASE_URL.rstrip("/")
+
+
+async def _require_supabase() -> None:
+    """Analytics must fail loudly: empty charts hide a missing config or migration."""
+    if not _credentials_present():
+        raise HTTPException(503, "Supabase is not configured on the server (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)")
+    ok, _ = await verify_supabase_connection()
+    if not ok:
+        raise HTTPException(503, "Supabase is unreachable")
+
+
+async def _get_rows(path: str, *, params: str) -> List[Dict[str, Any]]:
+    """Like _get, but a failed query is an HTTP 502 instead of looking like 'no data'."""
+    await _require_supabase()
+    rows = await _get(path, params=params)
+    if rows is None:
+        raise HTTPException(
+            502,
+            f"Supabase query on {path} failed; check that all migrations are applied (see server log)",
+        )
+    return rows
+
+
+async def _count(path: str, *, params: str) -> int:
+    """Exact row count for a filter via PostgREST Content-Range."""
+    url = f"{_base_url()}/rest/v1/{path}?select=id&limit=1"
+    if params:
+        url = f"{url}&{params}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={**_headers(prefer="count=exact")}) as resp:
+                if resp.status >= 400:
+                    logger.warning(f"Supabase count {path} failed {resp.status}: {(await resp.text())[:300]}")
+                    return 0
+                total = resp.headers.get("Content-Range", "*/0").rsplit("/", 1)[-1]
+                return int(total) if total.isdigit() else 0
+    except Exception as e:
+        logger.warning(f"Supabase count {path} error: {e}")
+        return 0
+
+
+def _own(user_id: str) -> str:
+    return f"user_id=eq.{quote(user_id)}"
 
 
 async def _get(path: str, *, params: str = "") -> Optional[Any]:
@@ -106,11 +153,12 @@ async def _delete(path: str, *, filter_str: str) -> bool:
 
 # ── Analytics (from voice_calls table) ──────────────────────────────
 
-async def get_dashboard_stats() -> Dict[str, Any]:
-    """Aggregate KPI stats from voice_calls."""
-    rows = await _get("voice_calls", params="select=id,created_at,direction,orchestrator_status,ended_at,from_number,to_number,provider,approved&order=created_at.desc&limit=500")
-    if not rows:
-        rows = []
+async def get_dashboard_stats(user_id: str) -> Dict[str, Any]:
+    """Aggregate KPI stats from the caller's voice_calls."""
+    rows = await _get_rows(
+        "voice_calls",
+        params=f"select=id,created_at,direction,orchestrator_status,ended_at,from_number,to_number,provider,approved&{_own(user_id)}&order=created_at.desc&limit=500",
+    )
 
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
@@ -124,7 +172,7 @@ async def get_dashboard_stats() -> Dict[str, Any]:
     outbound = sum(1 for r in rows if r.get("direction") == "outbound")
 
     # Yesterday comparison
-    yesterday_str = (now.replace(hour=0, minute=0, second=0) - __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     yesterday_calls = sum(1 for r in rows if (r.get("created_at") or "")[:10] == yesterday_str)
 
     return {
@@ -142,16 +190,14 @@ async def get_dashboard_stats() -> Dict[str, Any]:
     }
 
 
-async def get_call_volume(days: int = 7) -> List[Dict[str, Any]]:
-    """Daily call volume breakdown for chart."""
-    rows = await _get(
+async def get_call_volume(user_id: str, days: int = 7) -> List[Dict[str, Any]]:
+    """Daily call volume breakdown for chart (last `days` days, including empty days)."""
+    start = (datetime.now(timezone.utc) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    rows = await _get_rows(
         "voice_calls",
-        params=f"select=created_at,direction&order=created_at.desc&limit={days * 100}"
+        params=f"select=created_at,direction&{_own(user_id)}&created_at=gte.{start}&order=created_at.desc&limit=5000",
     )
-    if not rows:
-        return []
 
-    from collections import defaultdict
     daily: Dict[str, Dict[str, int]] = defaultdict(lambda: {"inbound": 0, "outbound": 0, "web": 0})
 
     for r in rows:
@@ -166,25 +212,17 @@ async def get_call_volume(days: int = 7) -> List[Dict[str, Any]]:
         else:
             daily[date]["web"] += 1
 
-    result = []
-    for date in sorted(daily.keys())[-days:]:
-        result.append({"period": date, **daily[date]})
-    return result
+    today = datetime.now(timezone.utc).date()
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+    return [{"period": date, **daily[date]} for date in dates]
 
 
-async def get_triage_outcomes() -> List[Dict[str, Any]]:
-    """Triage outcome distribution from clinical reports."""
-    rows = await _get(
+async def get_triage_outcomes(user_id: str) -> List[Dict[str, Any]]:
+    """Triage outcome distribution from the caller's clinical reports."""
+    rows = await _get_rows(
         "voice_calls",
-        params="select=orchestrator_status,clinical_report&orchestrator_status=eq.completed&limit=200"
+        params=f"select=orchestrator_status,clinical_report&{_own(user_id)}&orchestrator_status=eq.completed&limit=200",
     )
-    if not rows:
-        return [
-            {"name": "Resolved same session", "value": 0},
-            {"name": "Follow-up scheduled", "value": 0},
-            {"name": "Escalated clinical", "value": 0},
-            {"name": "Patient left / dropped", "value": 0},
-        ]
 
     resolved = 0
     followup = 0
@@ -206,8 +244,7 @@ async def get_triage_outcomes() -> List[Dict[str, Any]]:
             resolved += 1
 
     # Count failed as dropped
-    failed_rows = await _get("voice_calls", params="select=id&orchestrator_status=eq.failed&limit=200")
-    dropped = len(failed_rows) if failed_rows else 0
+    dropped = await _count("voice_calls", params=f"{_own(user_id)}&orchestrator_status=eq.failed")
 
     return [
         {"name": "Resolved same session", "value": resolved},
@@ -217,9 +254,9 @@ async def get_triage_outcomes() -> List[Dict[str, Any]]:
     ]
 
 
-async def get_pipeline_stats() -> Dict[str, Any]:
+async def get_pipeline_stats(user_id: str) -> Dict[str, Any]:
     """Orchestrator pipeline completion stats."""
-    rows = await _get("voice_calls", params="select=orchestrator_status&limit=500")
+    rows = await _get_rows("voice_calls", params=f"select=orchestrator_status&{_own(user_id)}&limit=500")
     if not rows:
         return {"current": 0, "target": 85, "total_runs": 0}
     total = len(rows)
@@ -228,7 +265,84 @@ async def get_pipeline_stats() -> Dict[str, Any]:
     return {"current": pct, "target": 85, "total_runs": total}
 
 
+def _percentile(values: List[float], pct: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    # nearest-rank percentile (round() would send 2.5 → 2 and under-report the median)
+    index = max(0, min(len(ordered) - 1, math.ceil(pct * len(ordered)) - 1))
+    return round(ordered[index], 3)
+
+
+async def get_latency_stats(user_id: str, limit: int = 200) -> Dict[str, Any]:
+    """Voice-to-voice latency across the caller's recent calls (from voice_calls.latency_metrics).
+
+    Our pipelines store per-turn latencies (services/voice_pipeline.py); Bolna calls store Bolna's
+    own timings under latency_metrics.bolna and are reported separately.
+    """
+    rows = await _get_rows(
+        "voice_calls",
+        params=f"select=created_at,provider,latency_metrics&{_own(user_id)}&order=created_at.desc&limit={limit}",
+    )
+    turns: List[float] = []
+    ttfb: Dict[str, List[float]] = defaultdict(list)
+    by_provider: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"calls": 0, "turns": []})
+    recent: List[Dict[str, Any]] = []
+    bolna_first_audio: List[float] = []
+
+    for r in rows:
+        lm = r.get("latency_metrics") or {}
+        if not isinstance(lm, dict):
+            continue
+        provider = r.get("provider") or "unknown"
+        call_turns = [t for t in (lm.get("turns") or []) if isinstance(t, (int, float))]
+        bolna = lm.get("bolna") if isinstance(lm.get("bolna"), dict) else {}
+        first_audio = bolna.get("time_to_first_audio")
+        if isinstance(first_audio, (int, float)):
+            bolna_first_audio.append(float(first_audio))
+        if not call_turns and not isinstance(first_audio, (int, float)):
+            continue
+        turns.extend(call_turns)
+        bucket = by_provider[provider]
+        bucket["calls"] += 1
+        bucket["turns"].extend(call_turns or [float(first_audio)])
+        for kind, summary in (lm.get("ttfb") or {}).items():
+            if isinstance(summary, dict) and isinstance(summary.get("p50"), (int, float)):
+                ttfb[kind].append(summary["p50"])
+        if len(recent) < 20:
+            recent.append(
+                {
+                    "created_at": r.get("created_at"),
+                    "provider": provider,
+                    "p50": _percentile(call_turns, 0.5) if call_turns else first_audio,
+                }
+            )
+
+    return {
+        "calls": sum(b["calls"] for b in by_provider.values()),
+        "turns": len(turns),
+        "p50": _percentile(turns, 0.5),
+        "p95": _percentile(turns, 0.95),
+        "ttfb_p50": {k: _percentile(v, 0.5) for k, v in ttfb.items()},
+        "by_provider": sorted(
+            (
+                {
+                    "provider": p,
+                    "calls": b["calls"],
+                    "p50": _percentile(b["turns"], 0.5),
+                    "p95": _percentile(b["turns"], 0.95),
+                }
+                for p, b in by_provider.items()
+            ),
+            key=lambda x: -x["calls"],
+        ),
+        "bolna_first_audio_p50": _percentile(bolna_first_audio, 0.5),
+        "recent": list(reversed(recent)),
+    }
+
+
 async def get_calls_history(
+    user_id: str,
     *,
     page: int = 1,
     limit: int = 20,
@@ -238,21 +352,21 @@ async def get_calls_history(
 ) -> Dict[str, Any]:
     """Paginated call history from voice_calls."""
     offset = (page - 1) * limit
-    params = f"select=*&order=created_at.desc&limit={limit}&offset={offset}"
+    filters = _own(user_id)
     if direction:
-        params += f"&direction=eq.{direction}"
+        filters += f"&direction=eq.{quote(direction)}"
     if provider:
-        params += f"&provider=eq.{provider}"
+        filters += f"&provider=eq.{quote(provider)}"
     if status:
-        params += f"&orchestrator_status=eq.{status}"
+        filters += f"&orchestrator_status=eq.{quote(status)}"
 
-    rows = await _get("voice_calls", params=params)
-    # Get total count
-    count_rows = await _get("voice_calls", params="select=id")
-    total = len(count_rows) if count_rows else 0
+    rows = await _get_rows(
+        "voice_calls", params=f"select=*&{filters}&order=created_at.desc&limit={limit}&offset={offset}"
+    )
+    total = await _count("voice_calls", params=filters)
 
     return {
-        "calls": rows or [],
+        "calls": rows,
         "total": total,
         "page": page,
         "limit": limit,
@@ -284,7 +398,8 @@ async def approve_report(call_id: str, user_id: str, notes: Optional[str] = None
     if not ok:
         return False
 
-    url = f"{_base_url()}/rest/v1/report_approvals"
+    # on_conflict: the unique key is (call_id, user_id), not the id primary key
+    url = f"{_base_url()}/rest/v1/report_approvals?on_conflict=call_id,user_id"
     headers = {
         **_headers(),
         "Prefer": "resolution=merge-duplicates,return=representation",
@@ -304,7 +419,7 @@ async def approve_report(call_id: str, user_id: str, notes: Optional[str] = None
     await _patch(
         "voice_calls",
         {"approved": True, "approved_by": user_id, "approved_at": datetime.now(timezone.utc).isoformat()},
-        filter_str=f"call_id=eq.{call_id}",
+        filter_str=f"call_id=eq.{quote(call_id)}&{_own(user_id)}",
     )
     return True
 
@@ -316,7 +431,7 @@ async def revoke_approval(call_id: str, user_id: str) -> bool:
         await _patch(
             "voice_calls",
             {"approved": False, "approved_by": None, "approved_at": None},
-            filter_str=f"call_id=eq.{call_id}",
+            filter_str=f"call_id=eq.{quote(call_id)}&{_own(user_id)}",
         )
     return ok
 
@@ -383,7 +498,7 @@ async def save_user_preferences(user_id: str, preferences: Dict[str, Any]) -> bo
         "preferences": preferences,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    url = f"{_base_url()}/rest/v1/user_preferences"
+    url = f"{_base_url()}/rest/v1/user_preferences?on_conflict=user_id"
     headers = {
         **_headers(),
         "Prefer": "resolution=merge-duplicates,return=minimal",

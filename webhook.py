@@ -158,6 +158,23 @@ async def root():
     }
 
 
+def ingest_call_payload(payload: Dict[str, Any]) -> str:
+    """Persist a call-end payload and start the post-call pipeline; returns the saved file path.
+
+    Shared by the HTTP webhook, Bolna executions and in-process delivery from our own pipelines.
+    """
+    call_id = payload.get("call_id", "unknown")
+    saved_file = _save_webhook_payload(call_id, payload)
+    logger.info(f"Saved full webhook payload to: {saved_file}")
+    try:
+        from services.post_call_pipeline import process_voice_call_webhook
+
+        asyncio.create_task(process_voice_call_webhook(dict(payload)))
+    except Exception as sched_err:
+        logger.warning(f"Post-call pipeline not scheduled: {sched_err}")
+    return saved_file
+
+
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """
@@ -220,16 +237,8 @@ async def receive_webhook(request: Request):
         if latency_metrics:
             logger.info(f"Latency metrics: {json.dumps(latency_metrics, indent=2)}")
         
-        # Persist full payload for later retrieval/debugging.
-        saved_file = _save_webhook_payload(call_id, payload)
-        logger.info(f"Saved full webhook payload to: {saved_file}")
-
-        try:
-            from services.post_call_pipeline import process_voice_call_webhook
-
-            asyncio.create_task(process_voice_call_webhook(dict(payload)))
-        except Exception as sched_err:
-            logger.warning(f"Post-call pipeline not scheduled: {sched_err}")
+        # Persist full payload for later retrieval/debugging, then run the post-call pipeline.
+        saved_file = ingest_call_payload(payload)
 
         # Return success response
         return JSONResponse(

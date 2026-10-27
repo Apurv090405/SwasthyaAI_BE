@@ -21,8 +21,10 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.settings import TTSSettings
 from pipecat.transcriptions.language import Language
 
+from services.sarvam_voice import TTS_FALLBACK_MODEL, V4_FLASH_UNSUPPORTED, tts_model, tts_voice
 
-# Languages bulbul:v3 can speak (see services/sarvam_voice.py)
+
+# Languages bulbul:v3 can speak; bulbul:v4-flash lacks ML/OR (see services/sarvam_voice.py)
 SARVAM_TTS_LANGUAGES = {
     Language.HI, Language.HI_IN,
     Language.BN, Language.BN_IN,
@@ -85,6 +87,20 @@ class LanguageDetectTTSSwitcher(FrameProcessor):
         super().__init__(**kwargs)
         self._current_language = default_language
         self._switch_count = 0
+        self._base_model = tts_model()
+        self._current_model = self._base_model
+
+    def _tts_delta(self, language: Language) -> TTSSettings:
+        model = (
+            TTS_FALLBACK_MODEL
+            if self._base_model == "bulbul:v4-flash" and language in V4_FLASH_UNSUPPORTED
+            else self._base_model
+        )
+        if model == self._current_model:
+            return TTSSettings(language=language)
+        logger.info(f"[LanguageDetect] {language} needs TTS model {model} (was {self._current_model})")
+        self._current_model = model
+        return TTSSettings(language=language, model=model, voice=tts_voice(model))
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -103,9 +119,11 @@ class LanguageDetectTTSSwitcher(FrameProcessor):
                     f"switching to {lang_name} ({normalized}) (switch #{self._switch_count})"
                 )
 
-                # 1. Switch TTS language
-                tts_frame = TTSUpdateSettingsFrame(delta=TTSSettings(language=normalized))
-                await self.push_frame(tts_frame, FrameDirection.DOWNSTREAM)
+                # 1. Switch TTS language (and model, when bulbul:v4-flash can't speak it)
+                await self.push_frame(
+                    TTSUpdateSettingsFrame(delta=self._tts_delta(normalized)),
+                    FrameDirection.DOWNSTREAM,
+                )
 
                 # 2. Tell the LLM to respond in the detected language
                 lang_instruction = (

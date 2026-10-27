@@ -32,6 +32,27 @@ async def current_user(authorization: Optional[str] = Header(None)) -> str:
     return await require_user(authorization)
 
 
+async def optional_user(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """For call-starting routes: the signed-in caller, or None without a token / Supabase."""
+    if not authorization or not (settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY):
+        return None
+    return await require_user(authorization)
+
+
+def call_owner(token_user: Optional[str], claimed: Optional[str]) -> Optional[str]:
+    """Who a call's report belongs to: the token's user wins over a user_id in the request.
+
+    Requests without a token (local demos, scripts) may still name a user_id; that is logged
+    because it is not verified.
+    """
+    claimed = (claimed or "").strip() or None
+    if token_user:
+        return token_user
+    if claimed:
+        logger.warning(f"[auth] call linked to unverified user_id={claimed} (no access token sent)")
+    return claimed
+
+
 async def _auth_user_id(authorization: str) -> str:
     async with aiohttp.ClientSession() as session:
         async with session.get(

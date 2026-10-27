@@ -7,7 +7,7 @@ phone registry, and paginated call history — all backed by Supabase.
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
 
 from auth import current_user
@@ -26,6 +26,7 @@ from services.supabase_dashboard import (
     get_approvals,
     get_call_volume,
     get_calls_history,
+    get_latency_stats,
     get_dashboard_stats,
     get_phone_registry,
     get_pipeline_stats,
@@ -41,32 +42,40 @@ dashboard_router = APIRouter(tags=["dashboard"])
 
 # ── Analytics ────────────────────────────────────────────────────────
 
+# Analytics and history read the caller's own voice_calls (user_id from the access token).
+# Supabase misconfiguration surfaces as 502/503 instead of silently empty charts.
+
 @dashboard_router.get("/analytics/dashboard")
-async def analytics_dashboard():
+async def analytics_dashboard(user_id: str = Depends(current_user)):
     """KPI stats for overview cards: today's calls, success rate, trends."""
-    stats = await get_dashboard_stats()
-    return stats
+    return await get_dashboard_stats(user_id)
 
 
 @dashboard_router.get("/analytics/call-volume")
-async def analytics_call_volume(days: int = Query(default=7, ge=1, le=90)):
+async def analytics_call_volume(
+    days: int = Query(default=7, ge=1, le=90), user_id: str = Depends(current_user)
+):
     """Daily call volume by direction (inbound/outbound/web) for bar chart."""
-    data = await get_call_volume(days=days)
+    data = await get_call_volume(user_id, days=days)
     return {"data": data, "days": days}
 
 
 @dashboard_router.get("/analytics/triage-outcomes")
-async def analytics_triage_outcomes():
+async def analytics_triage_outcomes(user_id: str = Depends(current_user)):
     """Triage outcome distribution for pie chart."""
-    data = await get_triage_outcomes()
-    return {"data": data}
+    return {"data": await get_triage_outcomes(user_id)}
 
 
 @dashboard_router.get("/analytics/pipeline-stats")
-async def analytics_pipeline_stats():
+async def analytics_pipeline_stats(user_id: str = Depends(current_user)):
     """Pipeline completion stats for gauge chart."""
-    stats = await get_pipeline_stats()
-    return stats
+    return await get_pipeline_stats(user_id)
+
+
+@dashboard_router.get("/analytics/latency")
+async def analytics_latency(user_id: str = Depends(current_user)):
+    """Voice-to-voice latency (p50/p95, per provider, STT/LLM/TTS first-byte) for the latency card."""
+    return await get_latency_stats(user_id)
 
 
 # ── Call History (paginated, filterable) ─────────────────────────────
@@ -78,9 +87,11 @@ async def calls_history(
     direction: Optional[str] = Query(default=None),
     provider: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
+    user_id: str = Depends(current_user),
 ):
     """Paginated call history with optional filters."""
     data = await get_calls_history(
+        user_id,
         page=page, limit=limit, direction=direction, provider=provider, status=status
     )
     return data
@@ -104,7 +115,7 @@ async def approve_report_endpoint(req: ApproveReportRequest, user_id: str = Depe
     ok = await approve_report(req.call_id, user_id, req.notes)
     if ok:
         return {"status": "approved", "call_id": req.call_id}
-    return {"status": "error", "message": "Failed to approve report"}
+    raise HTTPException(502, "Failed to approve report (database error, see server log)")
 
 
 @dashboard_router.post("/reports/revoke")
@@ -113,7 +124,7 @@ async def revoke_report_endpoint(req: ApproveReportRequest, user_id: str = Depen
     ok = await revoke_approval(req.call_id, user_id)
     if ok:
         return {"status": "revoked", "call_id": req.call_id}
-    return {"status": "error", "message": "Failed to revoke approval"}
+    raise HTTPException(502, "Failed to revoke approval (database error, see server log)")
 
 
 # ── Agent Configuration ──────────────────────────────────────────────
@@ -133,7 +144,7 @@ async def save_agent_config_endpoint(req: AgentConfigRequest, user_id: str = Dep
     config_id = await save_agent_config(user_id, req.config, req.name)
     if config_id:
         return {"status": "saved", "id": config_id}
-    return {"status": "error", "message": "Failed to save config"}
+    raise HTTPException(502, "Failed to save config (database error, see server log)")
 
 
 # ── User Preferences ────────────────────────────────────────────────
@@ -151,7 +162,7 @@ async def save_user_prefs(req: UserPreferencesRequest, user_id: str = Depends(cu
     ok = await save_user_preferences(user_id, req.preferences)
     if ok:
         return {"status": "saved", "user_id": user_id}
-    return {"status": "error", "message": "Failed to save preferences"}
+    raise HTTPException(502, "Failed to save preferences (database error, see server log)")
 
 
 # ── Phone Registry ──────────────────────────────────────────────────
@@ -171,7 +182,7 @@ async def add_phone_registry(req: PhoneRegistryRequest, user_id: str = Depends(c
     )
     if entry_id:
         return {"status": "added", "id": entry_id}
-    return {"status": "error", "message": "Failed to add phone number"}
+    raise HTTPException(502, "Failed to add phone number (database error, see server log)")
 
 
 @dashboard_router.post("/phone-registry/delete")
@@ -180,4 +191,4 @@ async def delete_phone_registry(req: PhoneRegistryDeleteRequest, user_id: str = 
     ok = await delete_phone_entry(req.entry_id, user_id)
     if ok:
         return {"status": "deleted", "id": req.entry_id}
-    return {"status": "error", "message": "Failed to delete phone entry"}
+    raise HTTPException(502, "Failed to delete phone entry (database error, see server log)")

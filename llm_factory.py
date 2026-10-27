@@ -103,11 +103,16 @@ def get_embeddings():
     )
 
 
-def get_openai_compat_params(provider: Optional[str] = None) -> dict:
+def get_openai_compat_params(provider: Optional[str] = None, purpose: str = "voice") -> dict:
     """
     Return kwargs needed to initialise Pipecat's OpenAILLMService for the
     given provider.  Gemini exposes an OpenAI-compatible REST endpoint so
     Pipecat can use it without a dedicated service class.
+
+    Args:
+        provider: 'openai' or 'gemini'.
+        purpose: 'voice' (live calls) picks the low-latency VOICE_* models;
+                 anything else uses the full OPENAI_MODEL / GEMINI_MODEL.
 
     Returns:
         dict with keys: api_key, model, and optionally base_url.
@@ -115,6 +120,7 @@ def get_openai_compat_params(provider: Optional[str] = None) -> dict:
     from config import settings
 
     resolved = provider or get_current_provider()
+    voice = purpose == "voice"
 
     if resolved == "gemini":
         if not settings.GEMINI_API_KEY:
@@ -123,7 +129,7 @@ def get_openai_compat_params(provider: Optional[str] = None) -> dict:
             )
         return {
             "api_key": settings.GEMINI_API_KEY,
-            "model": settings.GEMINI_MODEL,
+            "model": settings.VOICE_GEMINI_MODEL if voice else settings.GEMINI_MODEL,
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         }
 
@@ -134,5 +140,5 @@ def get_openai_compat_params(provider: Optional[str] = None) -> dict:
         )
     return {
         "api_key": settings.OPENAI_API_KEY,
-        "model": settings.OPENAI_MODEL,
+        "model": settings.VOICE_OPENAI_MODEL if voice else settings.OPENAI_MODEL,
     }

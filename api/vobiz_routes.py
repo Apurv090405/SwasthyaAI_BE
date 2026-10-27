@@ -8,31 +8,23 @@ import asyncio
 from typing import Dict, Any, Optional
 
 import aiohttp
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, BackgroundTasks, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import TTSSpeakFrame
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.serializers.plivo import PlivoFrameSerializer
-from services.sarvam_voice import make_stt, make_tts
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.transcriptions.language import Language
 
+from auth import call_owner, optional_user
 from config import settings
-from llm_factory import get_openai_compat_params
 from api.voice_routes import get_global_session, load_prompt_from_file
+from services.voice_pipeline import (
+    TELEPHONY_SAMPLE_RATE,
+    build_voice_session,
+    greeting_for,
+    run_voice_session,
+)
 
 vobiz_router = APIRouter(prefix="/vobiz", tags=["vobiz"])
 
@@ -176,32 +168,20 @@ async def run_vobiz_pipeline(
     to_number = call_data.get("data", {}).get("To") or call_data.get("data", {}).get("to")
 
     prompt_content = None
-    if to_number and to_number in AGENT_CONFIG:
+    override = AGENT_CONFIG.get(to_number) if to_number else None
+    # Ignore placeholders such as "string" saved from the Swagger UI
+    if override and len(override.strip()) >= 80:
         logger.info(f"Using specific prompt for number: {to_number}")
-        prompt_content = AGENT_CONFIG[to_number]
+        prompt_content = override
+    elif override:
+        logger.warning(f"Ignoring too-short prompt override for {to_number!r} ({len(override)} chars)")
 
     if not prompt_content:
         prompt_file = "outbound_prompt.md" if call_data.get("direction") == "outbound" else "inbound_prompt.md"
         prompt_content = load_prompt_from_file(prompt_file)
 
-    system_prompt = prompt_content
+    direction = call_data.get("direction") or "inbound"
 
-    # Initialize LLM service — Gemini uses its OpenAI-compatible endpoint
-    llm_params = get_openai_compat_params(llm_provider)
-    llm_service = OpenAILLMService(**llm_params)
-    
-    stt_service = make_stt()  # auto-detects the caller's language
-    tts_service = make_tts(sample_rate=8000)
-
-    # Dynamic language switcher — updates TTS language when STT detects a new language
-    from services.language_detect import LanguageDetectTTSSwitcher
-    language_switcher = LanguageDetectTTSSwitcher(default_language=Language.HI)
-
-    # Context
-    messages = [{"role": "system", "content": system_prompt}]
-    context = LLMContext(messages=messages)
-
-    # Transport & Serializer
     # Vobiz uses Plivo-compatible XML and WebSocket framing
     serializer = PlivoFrameSerializer(
         stream_id=stream_id,
@@ -209,15 +189,9 @@ async def run_vobiz_pipeline(
         auth_id=settings.VOBIZ_AUTH_ID,
         auth_token=settings.VOBIZ_AUTH_TOKEN,
         params=PlivoFrameSerializer.InputParams(
-            plivo_sample_rate=8000,
+            plivo_sample_rate=TELEPHONY_SAMPLE_RATE,
             auto_hang_up=True
         )
-    )
-
-    vad_analyzer = SileroVADAnalyzer(params=VADParams(start_secs=0.1, stop_secs=0.2))
-    # Pipecat 1.x: VAD lives on the user aggregator; Smart Turn v3 is the default stop strategy.
-    context_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
     )
 
     transport = FastAPIWebsocketTransport(
@@ -229,56 +203,47 @@ async def run_vobiz_pipeline(
             serializer=serializer,
         ),
     )
-
-    # Pipeline
-    processors = [
-        transport.input(),
-        stt_service,
-        language_switcher,
-        context_aggregator.user(),
-        llm_service,
-        tts_service,
-        transport.output(),
-        context_aggregator.assistant(),
-    ]
-
-    pipeline = Pipeline(processors)
-
-    task = PipelineTask(
-        pipeline=pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
+    session = build_voice_session(
+        transport=transport,
+        sample_rate=TELEPHONY_SAMPLE_RATE,
+        system_prompt=prompt_content,
+        llm_provider=llm_provider,
+        greeting=greeting_for(direction),
+        label=f"vobiz-{direction}",
     )
 
     @transport.event_handler("on_client_connected")
     async def on_connect(trans, client):
         logger.info(f"Vobiz client connected: {stream_id}")
-        # Initial greeting
-        greeting = "नमस्ते! मैं स्वास्थ्य AI से बोल रहा हूँ। मैं आपकी कैसे मदद कर सकता हूँ?"
-        await task.queue_frames([TTSSpeakFrame(greeting)])
+        await session.speak_greeting()
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnect(trans, client):
         logger.info(f"Vobiz client disconnected: {stream_id}")
-        await task.cancel()
+        await session.task.cancel()
 
-    runner = PipelineRunner()
-    try:
-        await runner.run(task)
-    except Exception as e:
-        logger.error(f"Pipeline error for {stream_id}: {e}")
-    finally:
-        # Cleanup
-        VOBIZ_CALLS.pop(stream_id, None)
-        logger.info(f"Pipeline finished for {stream_id}")
+    # Sends the call webhook too, so Vobiz calls now get a clinical report like the others
+    await run_voice_session(
+        session,
+        websocket,
+        stream_id=stream_id,
+        pop_call_info=lambda: {
+            "provider": "vobiz",
+            "direction": direction,
+            "to": to_number or "unknown",
+            **call_data,
+            **(VOBIZ_CALLS.pop(stream_id, None) or {}),
+        },
+        call_id_from_info=lambda info: info.get("call_uuid") or stream_id,
+    )
 
 
 @vobiz_router.post("/outbound")
-async def vobiz_outbound(payload: Dict[str, Any], request: Request):
+async def vobiz_outbound(
+    payload: Dict[str, Any],
+    request: Request,
+    token_user: Optional[str] = Depends(optional_user),
+):
     """Initiate an outbound call via Vobiz.
 
     Accepts an optional `llm_provider` field ('openai' or 'gemini') in the
@@ -305,6 +270,7 @@ async def vobiz_outbound(payload: Dict[str, Any], request: Request):
         VOBIZ_CALLS[call_uuid or to_number] = {
             "direction": "outbound",
             "llm_provider": llm_provider,
+            "supabase_user_id": call_owner(token_user, payload.get("user_id")),
         }
 
         return JSONResponse({
@@ -331,15 +297,23 @@ async def vobiz_answer(request: Request):
     call_uuid = data.get("CallUUID") or str(uuid.uuid4())
     stream_id = str(uuid.uuid4())
 
-    # Inherit llm_provider if stored from the outbound initiation
-    prior_info = VOBIZ_CALLS.pop(call_uuid, {})
+    # Inherit what the outbound initiation stored (keyed by Plivo-style request_uuid or call_uuid)
+    prior_info = (
+        VOBIZ_CALLS.pop(data.get("RequestUUID") or "", None)
+        or VOBIZ_CALLS.pop(call_uuid, None)
+        or {}
+    )
     llm_provider = prior_info.get("llm_provider", "openai")
 
-    # Store call info including llm_provider for the WebSocket handler
+    # Store call info for the WebSocket handler
     VOBIZ_CALLS[stream_id] = {
         "call_uuid": call_uuid,
         "status": "connecting",
         "llm_provider": llm_provider,
+        "direction": prior_info.get("direction") or "inbound",
+        "supabase_user_id": prior_info.get("supabase_user_id"),
+        "from": data.get("From"),
+        "to": data.get("To"),
         "data": dict(data),
     }
     

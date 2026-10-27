@@ -13,34 +13,26 @@ from contextlib import asynccontextmanager
 import aiohttp
 from aiohttp import client_exceptions as aiohttp_client_exc
 import httpx
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
-from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.serializers.exotel import ExotelFrameSerializer
-from services.sarvam_voice import make_stt, make_tts
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.transcriptions.language import Language
-
-LATENCY_OBSERVER_AVAILABLE = True
 
 # Project root (parent of `api/`) — prompt files are always loaded from here
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+from auth import call_owner, optional_user
 from config import settings
-from llm_factory import get_openai_compat_params
+from services.voice_pipeline import (
+    TELEPHONY_SAMPLE_RATE,
+    LatencyCollector,
+    build_voice_session,
+    greeting_for,
+    run_voice_session,
+)
 
 # Try to import RAG components (optional, for endpoints only)
 # Environment is loaded once from project-root `.env` in config.py
@@ -139,19 +131,34 @@ def make_ws_url(stream_id: str, call_id: Optional[str] = None) -> str:
     return f"wss://{settings.HOST}/ws/exotel/{stream_id}{query}"
 
 
+def _webhook_is_local() -> bool:
+    """True when WEBHOOK_URL is unset or points back at this server (localhost:PORT or its ngrok host)."""
+    from urllib.parse import urlparse
+
+    if not settings.WEBHOOK_URL:
+        return True
+    url = urlparse(settings.WEBHOOK_URL)
+    host = (url.hostname or "").lower()
+    public_host = (settings.TELNYX_PUBLIC_HOST or "").split("/")[0].lower()
+    if public_host and host == public_host:
+        return True
+    return host in {"localhost", "127.0.0.1", "0.0.0.0"} and url.port == settings.PORT
+
+
 async def send_call_webhook(
     stream_id: str,
     call_id: str,
     context: Optional[LLMContext] = None,
     task: Optional[PipelineTask] = None,
     call_info: Optional[Dict[str, Any]] = None,
-    latency_observer: Optional[UserBotLatencyObserver] = None
+    latency_observer: Optional[LatencyCollector] = None
 ):
-    """Send call transcript, metrics, and related information to webhook."""
-    if not settings.WEBHOOK_URL:
-        logger.debug("Webhook URL not configured, skipping webhook call")
-        return
-    
+    """Deliver call transcript, metrics and call info to the post-call pipeline.
+
+    With no WEBHOOK_URL, or one pointing back at this server, the payload is ingested
+    in-process (no HTTP hop through ngrok, and calls are never silently dropped). An external
+    WEBHOOK_URL still receives an HTTP POST.
+    """
     try:
         # Collect transcript from context
         transcript_messages = []
@@ -217,6 +224,8 @@ async def send_call_webhook(
                 "supabase_user_id": call_data.get("supabase_user_id"),
                 "llm_provider": call_data.get("llm_provider", "openai"),
                 "provider": call_data.get("provider", "telnyx"),
+                # emergencies spotted live during the call (services/red_flags.py)
+                "red_flags": call_data.get("red_flags") or [],
             },
             "transcript": {
                 "full_text": full_transcript,
@@ -229,6 +238,13 @@ async def send_call_webhook(
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
         
+        if _webhook_is_local():
+            from webhook import ingest_call_payload
+
+            saved = ingest_call_payload(payload)
+            logger.info(f"Call {call_id} ingested in-process → post-call pipeline ({saved})")
+            return
+
         # Send to webhook
         session = await get_global_session()
         async with session.post(
@@ -252,55 +268,17 @@ async def send_call_webhook(
         logger.exception(f"Error sending webhook for call {call_id}: {e}")
 
 
-async def run_inbound_pipeline(
+async def _run_exotel_pipeline(
     websocket: WebSocket,
     stream_id: str,
     call_id: str,
+    direction: str,
     llm_provider: str = "openai",
 ):
-    """Run the Pipecat pipeline for inbound calls with optimized real-time performance."""
+    """Run the shared Pipecat voice pipeline over an Exotel media stream."""
     logger.info(
-        f"Starting INBOUND pipeline for stream_id={stream_id}, "
+        f"Starting {direction.upper()} pipeline for stream_id={stream_id}, "
         f"call_id={call_id}, llm_provider={llm_provider}"
-    )
-
-    # Load inbound prompt
-    inbound_prompt = load_prompt_from_file("inbound_prompt.md")
-
-    # Initialize LLM service — Gemini uses its OpenAI-compatible endpoint
-    llm_params = get_openai_compat_params(llm_provider)
-    llm_service = OpenAILLMService(**llm_params)
-    stt_service = make_stt()  # auto-detects the caller's language
-    tts_service = make_tts(sample_rate=8000)
-
-    # Dynamic language switcher — updates TTS language when STT detects a new language
-    from services.language_detect import LanguageDetectTTSSwitcher
-    language_switcher = LanguageDetectTTSSwitcher(default_language=Language.HI)
-
-    # Set up context with inbound prompt
-    initial_system_message = {
-        "role": "system",
-        "content": inbound_prompt
-    }
-    context = LLMContext(messages=[initial_system_message])
-
-    # Serializer for Exotel
-    serializer = ExotelFrameSerializer(stream_sid=stream_id, call_sid=call_id)
-
-    # Transport layer with optimized VAD and Smart Turn Detection
-    # VAD Parameters:
-    # - start_secs=0.1: Lower threshold for faster detection of short utterances (e.g., "OK", "Yes")
-    # - stop_secs=0.2: Optimized for Smart Turn Detection (recommended 0.2s when using Smart Turn)
-    vad_params = VADParams(
-        start_secs=0.1,  # Lower for better short utterance detection
-        stop_secs=0.2,   # Optimized for Smart Turn Detection
-    )
-    vad_analyzer = SileroVADAnalyzer(params=vad_params)
-
-    # Pipecat 1.x: VAD lives on the user aggregator (transport params would silently ignore it).
-    # Smart Turn v3 (LocalSmartTurnAnalyzerV3) is already the default user-turn stop strategy.
-    context_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
     )
 
     transport = FastAPIWebsocketTransport(
@@ -309,102 +287,50 @@ async def run_inbound_pipeline(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            serializer=serializer,
+            serializer=ExotelFrameSerializer(stream_sid=stream_id, call_sid=call_id),
         ),
     )
-
-    # Initialize processors
-    processors = [
-        transport.input(),
-        stt_service,
-        language_switcher,
-    ]
-
-    processors.extend([
-        context_aggregator.user(),
-        llm_service,
-        tts_service,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
-    
-    # Build pipeline
-    pipeline = Pipeline(processors)
-
-    # Create observers for monitoring and optimization
-    observers = []
-    latency_observer = None
-    if LATENCY_OBSERVER_AVAILABLE:
-        latency_observer = UserBotLatencyObserver()
-        observers.append(latency_observer)
-        logger.info(f"Latency monitoring enabled for stream {stream_id}")
-
-    task = PipelineTask(
-        pipeline=pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=observers if observers else None,
+    session = build_voice_session(
+        transport=transport,
+        sample_rate=TELEPHONY_SAMPLE_RATE,
+        system_prompt=load_prompt_from_file(f"{direction}_prompt.md"),
+        llm_provider=llm_provider,
+        greeting=greeting_for(direction),
+        label=f"exotel-{direction}",
     )
 
-    # Event hooks
     @transport.event_handler("on_client_connected")
     async def _on_connect(trans, client):
-        logger.info(f"Inbound client connected on stream {stream_id}")
-        inbound_welcome = "Swasthya AI में आपका स्वागत है! कॉल करने के लिए धन्यवाद। मैं आज आपकी किस प्रकार सहायता कर सकता/सकती हूँ?"
-        await task.queue_frames([TTSSpeakFrame(inbound_welcome)])
+        logger.info(f"{direction} client connected on stream {stream_id}")
+        await session.speak_greeting()
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(trans, client):
-        logger.info(f"Inbound client disconnected stream {stream_id}")
-        await task.cancel()
+        logger.info(f"{direction} client disconnected stream {stream_id}")
+        await session.task.cancel()
 
-    runner = PipelineRunner()
-    try:
-        await runner.run(task)
-    except asyncio.CancelledError:
-        logger.info(f"Inbound pipeline cancelled for stream {stream_id}")
-    except Exception as e:
-        logger.exception(f"Inbound pipeline error for stream {stream_id}: {e}")
-        # Re-raise to ensure proper cleanup
-        raise
-    finally:
-        logger.info(f"Cleaning up inbound pipeline for stream {stream_id}")
-        try:
-            # Send interruption frame to stop any ongoing TTS
-            await task.queue_frames([InterruptionFrame()])
-        except Exception as e:
-            logger.warning(f"Error sending interruption frame: {e}")
-        
-        # Get call info before removing from CALLS
-        call_info = CALLS.get(stream_id, {}).copy()
-        CALLS.pop(stream_id, None)
-        
-        # Send webhook with transcript, metrics, and call info
-        try:
-            await send_call_webhook(
-                stream_id=stream_id,
-                call_id=call_id,
-                context=context,
-                task=task,
-                call_info=call_info,
-                latency_observer=latency_observer
-            )
-        except Exception as e:
-            logger.warning(f"Error sending webhook (non-fatal): {e}")
-        
-        # Close websocket gracefully
-        try:
-            await websocket.close()
-        except Exception as e:
-            # WebSocket may already be closed, which is fine
-            logger.debug(f"Error closing websocket (may already be closed): {e}")
-        
-        # Note: We don't close the global session here as it's shared
-        logger.info(f"Inbound pipeline closed for stream {stream_id}")
+    await run_voice_session(
+        session,
+        websocket,
+        stream_id=stream_id,
+        call_id=call_id,
+        pop_call_info=lambda: {
+            "provider": "exotel",
+            "direction": direction,
+            "llm_provider": llm_provider,
+            **(CALLS.pop(stream_id, None) or {}),
+        },
+    )
+
+
+async def run_inbound_pipeline(
+    websocket: WebSocket,
+    stream_id: str,
+    call_id: str,
+    llm_provider: str = "openai",
+):
+    """Run the Pipecat pipeline for inbound Exotel calls."""
+    await _run_exotel_pipeline(websocket, stream_id, call_id, "inbound", llm_provider)
 
 
 async def run_outbound_pipeline(
@@ -413,153 +339,8 @@ async def run_outbound_pipeline(
     call_id: str,
     llm_provider: str = "openai",
 ):
-    """Run the Pipecat pipeline for outbound calls with optimized real-time performance."""
-    logger.info(
-        f"Starting OUTBOUND pipeline for stream_id={stream_id}, "
-        f"call_id={call_id}, llm_provider={llm_provider}"
-    )
-
-    # Load outbound prompt
-    outbound_prompt = load_prompt_from_file("outbound_prompt.md")
-
-    # Initialize LLM service — Gemini uses its OpenAI-compatible endpoint
-    llm_params = get_openai_compat_params(llm_provider)
-    llm_service = OpenAILLMService(**llm_params)
-    stt_service = make_stt()  # auto-detects the caller's language
-    tts_service = make_tts(sample_rate=8000)
-
-    # Dynamic language switcher — updates TTS language when STT detects a new language
-    from services.language_detect import LanguageDetectTTSSwitcher
-    language_switcher = LanguageDetectTTSSwitcher(default_language=Language.HI)
-
-    # Set up context with outbound prompt
-    initial_system_message = {
-        "role": "system",
-        "content": outbound_prompt
-    }
-    context = LLMContext(messages=[initial_system_message])
-
-    # Serializer for Exotel
-    serializer = ExotelFrameSerializer(stream_sid=stream_id, call_sid=call_id)
-
-    # Transport layer with optimized VAD and Smart Turn Detection
-    # VAD Parameters:
-    # - start_secs=0.1: Lower threshold for faster detection of short utterances (e.g., "OK", "Yes")
-    # - stop_secs=0.2: Optimized for Smart Turn Detection (recommended 0.2s when using Smart Turn)
-    vad_params = VADParams(
-        start_secs=0.1,  # Lower for better short utterance detection
-        stop_secs=0.2,   # Optimized for Smart Turn Detection
-    )
-    vad_analyzer = SileroVADAnalyzer(params=vad_params)
-
-    # Pipecat 1.x: VAD lives on the user aggregator (transport params would silently ignore it).
-    # Smart Turn v3 (LocalSmartTurnAnalyzerV3) is already the default user-turn stop strategy.
-    context_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
-    )
-
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            add_wav_header=False,
-            serializer=serializer,
-        ),
-    )
-
-    # Initialize processors
-    processors = [
-        transport.input(),
-        stt_service,
-        language_switcher,
-    ]
-
-    processors.extend([
-        context_aggregator.user(),
-        llm_service,
-        tts_service,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
-    
-    # Build pipeline
-    pipeline = Pipeline(processors)
-
-    # Create observers for monitoring and optimization
-    observers = []
-    latency_observer = None
-    if LATENCY_OBSERVER_AVAILABLE:
-        latency_observer = UserBotLatencyObserver()
-        observers.append(latency_observer)
-        logger.info(f"Latency monitoring enabled for stream {stream_id}")
-
-    task = PipelineTask(
-        pipeline=pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=observers if observers else None,
-    )
-
-    # Event hooks
-    @transport.event_handler("on_client_connected")
-    async def _on_connect(trans, client):
-        logger.info(f"Outbound client connected on stream {stream_id}")
-        outbound_welcome = "Swasthya AI में आपका स्वागत है! कॉल करने के लिए धन्यवाद। मैं आज आपकी किस प्रकार सहायता कर सकता/सकती हूँ?"
-        await task.queue_frames([TTSSpeakFrame(outbound_welcome)])
-
-    @transport.event_handler("on_client_disconnected")
-    async def _on_disconnect(trans, client):
-        logger.info(f"Outbound client disconnected stream {stream_id}")
-        await task.cancel()
-
-    runner = PipelineRunner()
-    try:
-        await runner.run(task)
-    except asyncio.CancelledError:
-        logger.info(f"Outbound pipeline cancelled for stream {stream_id}")
-    except Exception as e:
-        logger.exception(f"Outbound pipeline error for stream {stream_id}: {e}")
-        # Re-raise to ensure proper cleanup
-        raise
-    finally:
-        logger.info(f"Cleaning up outbound pipeline for stream {stream_id}")
-        try:
-            # Send interruption frame to stop any ongoing TTS
-            await task.queue_frames([InterruptionFrame()])
-        except Exception as e:
-            logger.warning(f"Error sending interruption frame: {e}")
-        
-        # Get call info before removing from CALLS
-        call_info = CALLS.get(stream_id, {}).copy()
-        CALLS.pop(stream_id, None)
-        
-        # Send webhook with transcript, metrics, and call info
-        try:
-            await send_call_webhook(
-                stream_id=stream_id,
-                call_id=call_id,
-                context=context,
-                task=task,
-                call_info=call_info,
-                latency_observer=latency_observer
-            )
-        except Exception as e:
-            logger.warning(f"Error sending webhook (non-fatal): {e}")
-        
-        # Close websocket gracefully
-        try:
-            await websocket.close()
-        except Exception as e:
-            # WebSocket may already be closed, which is fine
-            logger.debug(f"Error closing websocket (may already be closed): {e}")
-        
-        # Note: We don't close the global session here as it's shared
-        logger.info(f"Outbound pipeline closed for stream {stream_id}")
+    """Run the Pipecat pipeline for outbound Exotel calls."""
+    await _run_exotel_pipeline(websocket, stream_id, call_id, "outbound", llm_provider)
 
 
 async def ws_exotel_endpoint(stream_id: str, websocket: WebSocket):
@@ -637,7 +418,11 @@ async def exotel_inbound(request: Request):
 
 
 @voice_router.post("/exotel/outbound")
-async def exotel_outbound(payload: Dict[str, Any], background_tasks: BackgroundTasks):
+async def exotel_outbound(
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    token_user: Optional[str] = Depends(optional_user),
+):
     """Handle outbound call request.
 
     Accepts an optional `llm_provider` field ('openai' or 'gemini') to select
@@ -683,6 +468,8 @@ async def exotel_outbound(payload: Dict[str, Any], background_tasks: BackgroundT
         "llm_provider": llm_provider,
         "exotel_response": result,
         "status": "initiated",
+        "provider": "exotel",
+        "supabase_user_id": call_owner(token_user, payload.get("user_id")),
     }
 
     logger.info(

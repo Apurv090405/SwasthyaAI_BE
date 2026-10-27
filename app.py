@@ -25,10 +25,12 @@ Endpoints (see /docs):
   (optional query on Telnyx: direction, llm_provider / llm — for local ``test_telnyx_websocket.py``)
 - POST /voice/exotel/inbound, /voice/exotel/outbound — Exotel
 - /vobiz/* — Vobiz integration
+- /bolna/* — Bolna as a second call engine (outbound, webhook, execution sync)
 
 CORS allows local Vite dev (e.g. http://localhost:3000).
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -37,21 +39,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from api import router
+from config import settings
 from api.voice_routes import voice_router, ws_exotel_endpoint, close_global_session
 from api.vobiz_routes import vobiz_router, run_vobiz_pipeline, VOBIZ_CALLS
 from api.telnyx_routes import telnyx_router, run_telnyx_pipeline, TELNYX_CALLS
 from api.web_call_routes import web_call_router, run_web_pipeline, WEB_CALLS
 from api.dashboard_routes import dashboard_router
 from api.voicelink_routes import voicelink_router
+from api.bolna_routes import bolna_router
 from services.supabase_voice import supabase_health_dict
+from services.voice_pipeline import warm_greetings
 from webhook import app as webhook_receiver_app, receive_webhook
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan: startup and shutdown events."""
-    # Startup: Global session will be created on first use
+    # Startup: pre-synthesize greetings so callers hear us at once (non-blocking; calls fall
+    # back to live TTS until it finishes). Global aiohttp session is created on first use.
+    warmup = asyncio.create_task(warm_greetings())
     yield
+    warmup.cancel()
     # Shutdown: Close global aiohttp session
     await close_global_session()
 
@@ -63,15 +71,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Browser dev server (Vite on :3000) and local variants
+# Browser origins from CORS_ORIGINS (defaults: Next on :3000, Vite on :5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,6 +120,7 @@ app.include_router(telnyx_router)
 app.include_router(web_call_router)
 app.include_router(dashboard_router)
 app.include_router(voicelink_router)
+app.include_router(bolna_router)
 
 # WebSocket endpoint at root level (Exotel calls this directly)
 @app.websocket("/ws/exotel/{stream_id}")
@@ -136,8 +140,7 @@ async def ws_vobiz_root(stream_id: str, websocket: WebSocket):
     try:
         await run_vobiz_pipeline(websocket, stream_id, call_data)
     except Exception as e:
-        # logger.error(f"Vobiz WebSocket error: {e}")
-        pass
+        logger.exception(f"Vobiz WebSocket error: {e}")
 
 
 @app.websocket("/ws/telnyx/{stream_id}")
@@ -157,7 +160,7 @@ async def ws_telnyx_root(stream_id: str, websocket: WebSocket):
     try:
         await run_telnyx_pipeline(websocket, stream_id, call_data)
     except Exception as e:
-        pass
+        logger.exception(f"Telnyx WebSocket error: {e}")
 
 
 @app.websocket("/ws/web/{stream_id}")
@@ -175,6 +178,5 @@ async def ws_web_root(stream_id: str, websocket: WebSocket):
     try:
         await run_web_pipeline(websocket, stream_id, call_data)
     except Exception as e:
-        logger.error(f"Web call WebSocket error: {e}")
-        pass
+        logger.exception(f"Web call WebSocket error: {e}")
 

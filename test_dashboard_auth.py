@@ -29,7 +29,7 @@ helpers = {
     "get_user_preferences": {}, "revoke_approval": True, "save_agent_config": "cfg-1",
     "save_user_preferences": True,
     "get_call_volume": [], "get_calls_history": {}, "get_dashboard_stats": {},
-    "get_pipeline_stats": {}, "get_triage_outcomes": [],
+    "get_pipeline_stats": {}, "get_triage_outcomes": [], "get_latency_stats": {},
 }
 # Load the route module by path with services stubbed (services/__init__ pulls in PDF + LanceDB).
 sys.modules["services"] = types.ModuleType("services")
@@ -77,6 +77,12 @@ routes = [
     ("get", "/phone-registry?user_id=bob", None),
     ("post", "/phone-registry", {"user_id": "bob", "phone_number": "+911234567890"}),
     ("post", "/phone-registry/delete", {"user_id": "bob", "entry_id": "e1"}),
+    ("get", "/analytics/dashboard?user_id=bob", None),
+    ("get", "/analytics/call-volume?days=7&user_id=bob", None),
+    ("get", "/analytics/triage-outcomes?user_id=bob", None),
+    ("get", "/analytics/pipeline-stats?user_id=bob", None),
+    ("get", "/calls/history?user_id=bob", None),
+    ("get", "/analytics/latency?user_id=bob", None),
 ]
 
 for method, path, body in routes:

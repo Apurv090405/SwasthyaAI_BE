@@ -143,6 +143,14 @@ async def process_voice_call_webhook(payload: Dict[str, Any]) -> None:
             await mark_voice_call_orchestrator_failed(row_id=row_id, error_message=str(e))
         return
 
+    # Emergencies the live pipeline flagged (services/red_flags.py): always shown to the doctor
+    live_flags = call_info.get("red_flags") or []
+    if live_flags:
+        report["live_red_flags"] = live_flags
+        meta = report.setdefault("report_meta", {})
+        if isinstance(meta, dict):
+            meta["human_review_required"] = True
+
     # Step 4: Save report
     logger.info(f"[PostCall] Step 4/4: Saving clinical report to disk and Supabase...")
 

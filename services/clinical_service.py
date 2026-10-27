@@ -89,6 +89,18 @@ def run_clinical_supervisor_report(
 
     set_llm_provider(provider)
 
+    if settings.CLINICAL_MODE != "supervisor":
+        from services.clinical_pipeline import run_fast_clinical_report
+
+        t_invoke = time.time()
+        content, steps = run_fast_clinical_report(transcript)
+        invoke_time = time.time() - t_invoke
+        parsed = _parse_report(content, userid, transcript, t0=t0, invoke_time=invoke_time, agents_invoked=9)
+        meta = parsed.setdefault("report_meta", {})
+        if isinstance(meta, dict):
+            meta["pipeline"] = {"mode": "fast", "steps_secs": steps}
+        return parsed, content[:2000]
+
     user_message = f"""
 Analyze this patient transcript in Hindi and provide a comprehensive medical report following the exact JSON structure.
 
@@ -152,7 +164,14 @@ IMPORTANT:
         content = str(raw_content)
 
     logger.debug(f"[Orchestrator] Final message length: {len(content)} chars")
+    parsed = _parse_report(content, userid, transcript, t0=t0, invoke_time=invoke_time, agents_invoked=len(messages))
+    return parsed, content[:2000]
 
+
+def _parse_report(
+    content: str, userid: str, transcript: str, *, t0: float, invoke_time: float, agents_invoked: int
+) -> Dict[str, Any]:
+    """Extract the report JSON from the final model text and fill in standard fields."""
     try:
         json_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, re.DOTALL)
         if json_match:
@@ -180,10 +199,10 @@ IMPORTANT:
             f"[Orchestrator] Report complete | "
             f"userid={userid} triage={triage_level} diagnosis={diagnosis_preview} "
             f"total_time={total_time:.1f}s invoke_time={invoke_time:.1f}s "
-            f"agents_invoked={len(messages)} report_keys={list(parsed_response.keys())[:8]}"
+            f"agents_invoked={agents_invoked} report_keys={list(parsed_response.keys())[:8]}"
         )
 
-        return parsed_response, content[:2000]
+        return parsed_response
     except (json.JSONDecodeError, AttributeError, KeyError) as e:
         total_time = time.time() - t0
         logger.error(

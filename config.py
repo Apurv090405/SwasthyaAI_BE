@@ -32,6 +32,15 @@ class Settings:
     OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-4.1")
     GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
     DEFAULT_LLM_PROVIDER: str = os.environ.get("DEFAULT_LLM_PROVIDER", "openai")
+    # Post-call report: "fast" = fixed order with parallel steps (services/clinical_pipeline.py);
+    # "supervisor" = the LangGraph supervisor routing all ten agents (slower, more LLM calls).
+    CLINICAL_MODE: str = os.environ.get("CLINICAL_MODE", "fast").strip().lower()
+    # Live calls use smaller, faster models than the post-call report agents
+    # (time to first token dominates voice-to-voice latency).
+    VOICE_OPENAI_MODEL: str = os.environ.get("VOICE_OPENAI_MODEL", "gpt-4.1-mini")
+    VOICE_GEMINI_MODEL: str = os.environ.get("VOICE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    VOICE_MAX_TOKENS: int = int(os.environ.get("VOICE_MAX_TOKENS", 150))
+    VOICE_TEMPERATURE: float = float(os.environ.get("VOICE_TEMPERATURE", 0.3))
     # API embedding model; empty = provider default (see llm_factory.get_embeddings)
     EMBEDDING_MODEL_NAME: str = os.environ.get("EMBEDDING_MODEL", "")
     
@@ -57,6 +66,15 @@ class Settings:
     
     # Voice Agent Configuration (Pipecat/Exotel)
     HOST: str = os.environ.get("HOST", "localhost")
+    # Browser origins allowed to call the API (comma-separated); add your tunnel / deployed FE host
+    CORS_ORIGINS: list = [
+        o.strip().rstrip("/")
+        for o in os.environ.get(
+            "CORS_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if o.strip()
+    ]
     PORT: int = int(os.environ.get("PORT", 8000))
     EXOTEL_ACCOUNT_SID: Optional[str] = os.environ.get("EXOTEL_SID")
     EXOTEL_AUTH_TOKEN: Optional[str] = os.environ.get("EXOTEL_API_TOKEN")
@@ -66,6 +84,9 @@ class Settings:
     SARVAM_API_KEY: Optional[str] = os.environ.get("SARVAM_API_KEY")
     # bulbul:v3 speaker (e.g. priya, ritu, neha, kavya, shubh, aditya); v2 names like anushka no longer work
     SARVAM_VOICE_ID: str = os.environ.get("SARVAM_VOICE_ID", "priya")
+    # bulbul:v3 (default, 11 languages) or bulbul:v4-flash (lower latency, no Malayalam/Odia;
+    # needs a v4-flash SARVAM_VOICE_ID from Sarvam's docs)
+    SARVAM_TTS_MODEL: str = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
     WEBHOOK_URL: Optional[str] = os.environ.get("WEBHOOK_URL")
 
     # Supabase (optional — service role for server-side voice_calls / analytics rows)
@@ -100,6 +121,13 @@ class Settings:
     # VoiceLink (India DIDs) — platform reseller account used for number purchase
     VOICELINK_USERNAME: Optional[str] = os.environ.get("VOICELINK_USERNAME")
     VOICELINK_PASSWORD: Optional[str] = os.environ.get("VOICELINK_PASSWORD")
+
+    # Bolna (second call engine — Bolna runs the live call, our clinical agents run after it).
+    # Create the agent once in the Bolna dashboard and set its webhook to <public host>/bolna/webhook.
+    BOLNA_API_KEY: Optional[str] = os.environ.get("BOLNA_API_KEY")
+    BOLNA_AGENT_ID: Optional[str] = os.environ.get("BOLNA_AGENT_ID")
+    BOLNA_FROM_NUMBER: Optional[str] = os.environ.get("BOLNA_FROM_NUMBER")
+    BOLNA_API_BASE: str = os.environ.get("BOLNA_API_BASE", "https://api.bolna.ai")
 
     def __init__(self):
         """Validate required settings on initialization."""

@@ -11,33 +11,25 @@ import uuid
 import asyncio
 from typing import Dict, Any, Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import TTSSpeakFrame, InterruptionFrame
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask, PipelineParams
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.serializers.telnyx import TelnyxFrameSerializer
 
 from api.telnyx_serializer import TelnyxMediaStreamSerializer
-from services.sarvam_voice import make_stt, make_tts
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.transcriptions.language import Language
 
+from auth import call_owner, optional_user
 from config import settings
-from llm_factory import get_openai_compat_params
 from api.voice_routes import get_global_session, load_prompt_from_file, send_call_webhook
+from services.voice_pipeline import (
+    TELEPHONY_SAMPLE_RATE,
+    build_voice_session,
+    greeting_for,
+    run_voice_session,
+)
 
 telnyx_router = APIRouter(prefix="/telnyx", tags=["telnyx"])
 
@@ -351,7 +343,11 @@ class OutboundCallParams(BaseModel):
 
 
 @telnyx_router.post("/outbound")
-async def telnyx_outbound(params: OutboundCallParams, request: Request):
+async def telnyx_outbound(
+    params: OutboundCallParams,
+    request: Request,
+    token_user: Optional[str] = Depends(optional_user),
+):
     """Initiate an outbound call via Telnyx TeXML.
 
     Flow:
@@ -382,7 +378,7 @@ async def telnyx_outbound(params: OutboundCallParams, request: Request):
         "to": params.to,
         "from": from_number,
         "status": "initiating",
-        "supabase_user_id": (params.user_id or "").strip() or None,
+        "supabase_user_id": call_owner(token_user, params.user_id),
         "provider": "telnyx",
     }
 
@@ -448,7 +444,11 @@ class ReportDeliveryParams(BaseModel):
 
 
 @telnyx_router.post("/report-callback")
-async def telnyx_report_callback(params: ReportDeliveryParams, request: Request):
+async def telnyx_report_callback(
+    params: ReportDeliveryParams,
+    request: Request,
+    token_user: Optional[str] = Depends(optional_user),
+):
     """Call the user back to deliver their clinical report summary.
 
     Fetches the saved clinical report for the given call_id, formats a summary,
@@ -536,7 +536,7 @@ async def telnyx_report_callback(params: ReportDeliveryParams, request: Request)
         "to": params.to,
         "from": from_number,
         "status": "initiating",
-        "supabase_user_id": (params.user_id or "").strip() or None,
+        "supabase_user_id": call_owner(token_user, params.user_id),
         "provider": "telnyx",
         "report_summary": report_summary,
         "original_call_id": params.call_id,
@@ -719,19 +719,6 @@ async def run_telnyx_pipeline(
     else:
         system_prompt = load_prompt_from_file("inbound_prompt.md")
 
-    llm_params = get_openai_compat_params(llm_provider)
-    llm_service = OpenAILLMService(**llm_params)
-
-    stt_service = make_stt()  # auto-detects the caller's language
-    tts_service = make_tts(sample_rate=8000)
-
-    # Dynamic language switcher — updates TTS language when STT detects a new language
-    from services.language_detect import LanguageDetectTTSSwitcher
-    language_switcher = LanguageDetectTTSSwitcher(default_language=Language.HI)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    context = LLMContext(messages=messages)
-
     telnyx_stream_ready = asyncio.Event()
 
     serializer = TelnyxMediaStreamSerializer(
@@ -741,20 +728,12 @@ async def run_telnyx_pipeline(
         call_control_id=call_control_id or None,
         api_key=settings.TELNYX_API_KEY,
         params=TelnyxFrameSerializer.InputParams(
-            telnyx_sample_rate=8000,
+            telnyx_sample_rate=TELEPHONY_SAMPLE_RATE,
             # Pipecat 1.x raises if auto_hang_up is on without a call_control_id (it's empty on
             # some inbound/outbound starts); without one the caller's hangup still ends the stream.
             auto_hang_up=bool(call_control_id),
         ),
         stream_ready=telnyx_stream_ready,
-    )
-
-    vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(start_secs=0.1, stop_secs=0.2)
-    )
-    # Pipecat 1.x: VAD lives on the user aggregator; Smart Turn v3 is the default stop strategy.
-    context_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad_analyzer)
     )
 
     transport = FastAPIWebsocketTransport(
@@ -766,99 +745,34 @@ async def run_telnyx_pipeline(
             serializer=serializer,
         ),
     )
-
-    pipeline = Pipeline([
-        transport.input(),
-        stt_service,
-        language_switcher,
-        context_aggregator.user(),
-        llm_service,
-        tts_service,
-        transport.output(),
-        context_aggregator.assistant(),
-    ])
-
-    task = PipelineTask(
-        pipeline=pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
+    session = build_voice_session(
+        transport=transport,
+        sample_rate=TELEPHONY_SAMPLE_RATE,
+        system_prompt=system_prompt,
+        llm_provider=llm_provider,
+        greeting=greeting_for(direction),
+        label=f"telnyx-{direction}",
     )
 
     @transport.event_handler("on_client_connected")
     async def on_connect(trans, client):
         logger.info(f"Telnyx client connected: {stream_id}, direction={direction}")
-
-        if direction == "report_delivery":
-            greeting = (
-                "नमस्ते, मैं SwasthyaAI से बोल रही हूँ। "
-                "आपने थोड़ी देर पहले हमसे बात की थी। "
-                "आपकी रिपोर्ट डॉक्टर ने रिव्यू कर ली है। मैं आपको रिजल्ट बताती हूँ।"
-            )
-        elif direction == "outbound":
-            greeting = (
-                "नमस्ते, मैं SwasthyaAI से बोल रही हूँ। "
-                "क्या यह बात करने का सही समय है?"
-            )
-        else:
-            greeting = (
-                "नमस्ते, मैं SwasthyaAI से बोल रही हूँ। "
-                "आप मुझे अपनी स्वास्थ्य समस्या बता सकते हैं।"
-            )
-
         try:
             await asyncio.wait_for(telnyx_stream_ready.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             logger.warning("Telnyx stream not ready in 5s; sending greeting anyway")
-        await task.queue_frames([TTSSpeakFrame(greeting)])
+        await session.speak_greeting()
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnect(trans, client):
         logger.info(f"Telnyx client disconnected: {stream_id}")
-        await task.cancel()
+        await session.task.cancel()
 
-    runner = PipelineRunner()
-    try:
-        await runner.run(task)
-    except asyncio.CancelledError:
-        logger.info(f"Telnyx pipeline cancelled: {stream_id}")
-    except Exception as e:
-        logger.info(f"Telnyx pipeline ended: {stream_id}: {type(e).__name__}: {e}")
-    finally:
-        logger.info(f"Cleaning up Telnyx pipeline: {stream_id}")
-
-        # Cancel the task if it's still running (handles abrupt disconnects)
-        try:
-            await task.cancel()
-        except Exception:
-            pass
-        try:
-            await task.queue_frames([InterruptionFrame()])
-        except Exception:
-            pass
-
-        call_info = TELNYX_CALLS.get(stream_id, {}).copy()
-        TELNYX_CALLS.pop(stream_id, None)
-
-        # Always send webhook to save transcript + trigger clinical report
-        try:
-            logger.info(f"Sending call webhook for {stream_id}...")
-            await send_call_webhook(
-                stream_id=stream_id,
-                call_id=call_info.get("call_sid", stream_id),
-                context=context,
-                task=task,
-                call_info=call_info,
-            )
-        except Exception as e:
-            logger.warning(f"Webhook send error (non-fatal): {e}")
-
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-        logger.info(f"Telnyx pipeline closed: {stream_id}")
+    # Always send the webhook: it saves the transcript and triggers the clinical report
+    await run_voice_session(
+        session,
+        websocket,
+        stream_id=stream_id,
+        pop_call_info=lambda: {**call_data, **(TELNYX_CALLS.pop(stream_id, None) or {})},
+        call_id_from_info=lambda info: info.get("call_sid", stream_id),
+    )
